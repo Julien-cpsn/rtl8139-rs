@@ -4,31 +4,30 @@
 //! * https://www.cs.usfca.edu/~cruse/cs326f04/RTL8139_ProgrammersGuide.pdf
 //! * https://www.cs.usfca.edu/~cruse/cs326f04/RTL8139D_DataSheet.pdf
 #![no_std]
-#![feature(type_alias_impl_trait)]
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
-
 use core::convert::TryInto;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "async")] {
-        use core::marker::PhantomData;
-        use core::pin::Pin;
-        use core::task::Context;
-        use core::task::Poll;
+#[cfg(feature = "async")]
+use core::marker::PhantomData;
+#[cfg(feature = "async")]
+use core::pin::Pin;
+#[cfg(feature = "async")]
+use core::task::Context;
+#[cfg(feature = "async")]
+use core::task::Poll;
+#[cfg(feature = "async")]
+use futures_util::sink::Sink;
+#[cfg(feature = "async")]
+use futures_util::stream::Stream;
+#[cfg(feature = "async")]
+use futures_util::task::AtomicWaker;
 
-        use futures_util::sink::Sink;
-        use futures_util::stream::Stream;
-        use futures_util::task::AtomicWaker;
-    }
-}
-
-use conquer_once::spin::OnceCell;
 use crossbeam_queue::SegQueue;
-use spin::RwLock;
+use log::debug;
+use x86_64::instructions::interrupts;
 use x86_64::instructions::port::Port;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -66,22 +65,22 @@ const RDU: u16 = 0b10000;
 const TDU: u16 = 0b1000_0000;
 const SYS_ERR: u16 = 0b1000_0000_0000_0000;
 
-static FRAMES: OnceCell<SegQueue<Vec<u8>>> = OnceCell::uninit();
-static RTL8139_STATE: OnceCell<Arc<RwLock<Rtl8139State>>> = OnceCell::uninit();
-
 #[cfg(feature = "async")]
 static WAKER: AtomicWaker = AtomicWaker::new();
 
 /// This is our inner struct that holds all of our ports that we will use to talk with the nic, as
 /// well as our rx and tx buffers.
-struct Rtl8139State {
+#[derive(Debug)]
+pub struct Rtl8139State {
     pub config_1: Port<u32>,
     pub cmd_reg: Port<u8>,
     pub rbstart: Port<u32>,
     pub imr: Port<u16>,
     pub rcr: Port<u32>,
+    #[allow(unused)]
     pub tppoll: Port<u8>,
     pub ack: Port<u16>,
+    #[allow(unused)]
     pub cpcr: Port<u16>,
     pub capr: Port<u16>,
 
@@ -98,8 +97,15 @@ struct Rtl8139State {
     pub virt_to_phys: fn(VirtAddr) -> PhysAddr,
 }
 
+#[derive(Debug)]
 pub struct RTL8139 {
-    mac: [u8; 6],
+    pub mac: [u8; 6],
+    pub state: Rtl8139State,
+    pub frames: SegQueue<Vec<u8>>,
+    #[cfg(feature = "async")]
+    pub rx: RxSink,
+    #[cfg(feature = "async")]
+    pub tx: TxSink
 }
 
 impl RTL8139 {
@@ -117,6 +123,7 @@ impl RTL8139 {
     /// The caller of this function must pass a valid port base for a valid PCI device. Furthermore
     /// the caller must ensure that mastering and interrupts for the PCI device are enabled.
     pub unsafe fn preload_unchecked(base: u16, virt_to_phys: fn(VirtAddr) -> PhysAddr) -> Self {
+        debug!("Preloading RTL8139");
         let inner = Rtl8139State {
             config_1: Port::new(base + 0x52),
             cmd_reg: Port::new(base + 0x37),
@@ -155,33 +162,37 @@ impl RTL8139 {
             rx_cursor: 0,
             virt_to_phys,
         };
-
-        FRAMES.init_once(|| SegQueue::new());
-        RTL8139_STATE.init_once(move || Arc::new(RwLock::new(inner)));
+        debug!("RTL8139 preloaded");
 
         Self {
             mac: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            state: inner,
+            frames: SegQueue::new(),
+            #[cfg(feature = "async")]
+            rx: RxSink::new(),
+            #[cfg(feature = "async")]
+            tx: TxSink::new(),
         }
     }
 
     /// Function sets up the device.
     pub fn load(&mut self) -> Result<(), ()> {
-        let mut inner = RTL8139_STATE.try_get().unwrap().write();
+        debug!("Loading RTL8139");
         // Turn the device on by writing to config_1 then reset the device to clear all data in the
         // buffers by writing 0x10 to cmd_reg
         unsafe {
-            inner.config_1.write(0x0);
-            inner.cmd_reg.write(RST);
+            self.state.config_1.write(0x0);
+            self.state.cmd_reg.write(RST);
         }
 
         // Wait while the device resets
         loop {
-            if (unsafe { inner.cmd_reg.read() } & 0x10) == 0 {
+            if (unsafe { self.state.cmd_reg.read() } & 0x10) == 0 {
                 break;
             }
         }
 
-        let raw_mac = inner
+        let raw_mac = self.state
             .idr
             .iter_mut()
             .map(|x| unsafe { x.read() })
@@ -192,8 +203,8 @@ impl RTL8139 {
             .try_into()
             .expect("rtl8139: failed to read mac");
 
-        let buffer_virt = unsafe { VirtAddr::new_unsafe(inner.buffer.as_ptr() as u64) };
-        let virt_to_phys = &inner.virt_to_phys;
+        let buffer_virt = unsafe { VirtAddr::new_unsafe(self.state.buffer.as_ptr() as u64) };
+        let virt_to_phys = &self.state.virt_to_phys;
         let buffer_ptr = virt_to_phys(buffer_virt).as_u64() as u32;
 
         // Unsafe block specific for pre-launch NIC config
@@ -202,43 +213,44 @@ impl RTL8139 {
             // Accept Broadcast packets
             // Enable Max DMA burst
             // No RX Threshold
-            inner
+            self.state
                 .rcr
                 .write(APM | AB | MXDMA_UNLIMITED | RXFTH_NONE | WRAP);
 
             // Enable Tx on the CR register
-            inner.cmd_reg.write(RX_ENABLE | TX_ENABLE);
+            self.state.cmd_reg.write(RX_ENABLE | TX_ENABLE);
 
             // Write the PHYSICAL address of our Rx buffer to the NIC
-            inner.rbstart.write(buffer_ptr);
+            self.state.rbstart.write(buffer_ptr);
         }
 
         // Unsafe block specific to launch of NIC
         unsafe {
             // Enable Tx/Rx
             // NOTE: TX is technically already enabled but fuck it
-            inner.cmd_reg.write(RX_ENABLE | TX_ENABLE);
+            self.state.cmd_reg.write(RX_ENABLE | TX_ENABLE);
 
             // Mask only RxOk, TxOk, and some Err registers for internal book-keeping
-            inner
+            self.state
                 .imr
                 .write(0xffff | RX_OK | TX_OK | RX_ERR | TX_ERR | SYS_ERR | RDU | TDU);
         }
+
+        debug!("RTL8139 loaded");
 
         Ok(())
     }
 
     /// Function that we need to call when we receive an interrupt for this device.
     /// The callee must ensure that the PIC/APIC has received an EOI.
-    pub fn on_interrupt() {
+    pub fn on_interrupt(&mut self) {
         // At some point here we will want to also wake the network stack because there are packets
         // available.
-        let mut inner = RTL8139_STATE.try_get().unwrap().write();
-        let isr = unsafe { inner.ack.read() };
+        let isr = unsafe { self.state.ack.read() };
 
         if (isr & RX_OK) != 0 {
-            while (unsafe { inner.cmd_reg.read() } & RX_BUF_EMPTY) == 0 {
-                FRAMES.try_get().unwrap().push(inner.rok());
+            while (unsafe { self.state.cmd_reg.read() } & RX_BUF_EMPTY) == 0 {
+                self.frames.push(self.state.rok());
 
                 #[cfg(feature = "async")]
                 WAKER.wake();
@@ -246,36 +258,21 @@ impl RTL8139 {
         }
 
         unsafe {
-            inner.ack.write(isr);
+            self.state.ack.write(isr);
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<Vec<u8>> {
-        FRAMES.try_get().unwrap().pop()
+    pub fn try_recv_sync(&mut self) -> Option<Vec<u8>> {
+        self.frames.pop()
     }
 
     /// FIXME: Disable interrupts for the PCI device only instead of globally.
-    pub fn send(&mut self, buffer: &[u8]) {
-        x86_64::instructions::interrupts::disable();
-        {
-            if let Some(mut lock) = RTL8139_STATE
-                .try_get()
-                .expect("rtl8139: state not init")
-                .try_write()
-            {
-                unsafe { lock.write(buffer) };
-            };
-        }
-        x86_64::instructions::interrupts::enable();
-    }
-
-    pub fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
-    #[cfg(feature = "async")]
-    pub fn parts(&mut self) -> (RxSink, TxSink) {
-        (RxSink::new(), TxSink::new())
+    pub fn send_sync(&mut self, buffer: &[u8]) {
+        interrupts::without_interrupts(||
+            unsafe {
+                self.state.write(buffer)
+            }
+        );
     }
 }
 
@@ -362,6 +359,7 @@ impl Rtl8139State {
 }
 
 #[cfg(feature = "async")]
+#[derive(Debug)]
 pub struct RxSink {
     _private: PhantomData<()>,
 }
@@ -376,27 +374,7 @@ impl RxSink {
 }
 
 #[cfg(feature = "async")]
-impl Stream for RxSink {
-    type Item = Vec<u8>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        if let Some(x) = FRAMES.try_get().unwrap().pop() {
-            return Poll::Ready(Some(x));
-        }
-
-        WAKER.register(&cx.waker());
-
-        match FRAMES.try_get().unwrap().pop() {
-            Some(x) => {
-                WAKER.take();
-                Poll::Ready(Some(x))
-            }
-            None => Poll::Pending,
-        }
-    }
-}
-
-#[cfg(feature = "async")]
+#[derive(Debug)]
 pub struct TxSink {
     buffer: Vec<Vec<u8>>,
 }
@@ -409,7 +387,28 @@ impl TxSink {
 }
 
 #[cfg(feature = "async")]
-impl Sink<Vec<u8>> for TxSink {
+impl Stream for RTL8139 {
+    type Item = Vec<u8>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        if let Some(x) = self.frames.pop() {
+            return Poll::Ready(Some(x));
+        }
+
+        WAKER.register(&cx.waker());
+
+        match self.frames.pop() {
+            Some(x) => {
+                WAKER.take();
+                Poll::Ready(Some(x))
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl Sink<Vec<u8>> for RTL8139 {
     type Error = ();
 
     fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -417,29 +416,17 @@ impl Sink<Vec<u8>> for TxSink {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
-        self.buffer.push(item);
+        self.tx.buffer.push(item);
         Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        x86_64::instructions::interrupts::disable();
-        {
-            let mut lock = if let Some(x) = RTL8139_STATE
-                .try_get()
-                .expect("rtl8139: state not init")
-                .try_write()
-            {
-                x
-            } else {
-                return Poll::Pending;
-            };
-
-            for item in self.buffer.drain(..) {
-                unsafe { lock.write(&item) };
+        interrupts::without_interrupts(|| {
+            let items = self.tx.buffer.drain(..).collect::<Vec<_>>();
+            for item in items {
+                unsafe { self.state.write(&item) };
             }
-        }
-        x86_64::instructions::interrupts::enable();
-
+        });
         Poll::Ready(Ok(()))
     }
 
@@ -447,3 +434,4 @@ impl Sink<Vec<u8>> for TxSink {
         self.poll_flush(cx)
     }
 }
+
