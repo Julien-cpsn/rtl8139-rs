@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
@@ -91,7 +92,7 @@ pub struct Rtl8139State {
     pub tx_cmd: [Port<u32>; 4],
     pub tx_cursor: usize,
 
-    pub buffer: [u8; RX_BUF_LEN_WRAPPED],
+    pub buffer: Box<[u8; RX_BUF_LEN_WRAPPED]>,
     pub rx_cursor: usize,
 
     pub virt_to_phys: fn(VirtAddr) -> PhysAddr,
@@ -158,7 +159,7 @@ impl RTL8139 {
             ],
             tx_cursor: 0,
 
-            buffer: [0u8; RX_BUF_LEN_WRAPPED],
+            buffer: Box::from([0u8; RX_BUF_LEN_WRAPPED]),
             rx_cursor: 0,
             virt_to_phys,
         };
